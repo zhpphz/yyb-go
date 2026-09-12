@@ -1,0 +1,67 @@
+name: Mirror GHCR -> Docker Hub (yyb-go)
+
+on:
+  schedule:
+    - cron: '*/30 * * * *' # 每30分钟检测一次
+  workflow_dispatch: # 允许手动触发
+
+permissions:
+  contents: read
+
+env:
+  SRC_ORG: 525815266
+  SRC_PKG: yyb-go-enhanced
+  DST_REPO: zhpphz/yyb-go # 你的目标镜像名
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install skopeo & jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Login Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Get latest GHCR version & digest
+        id: ghcr
+        run: |
+          DATA=$(curl -s "https://api.github.com/users/${{ env.SRC_ORG }}/packages/container/${{ env.SRC_PKG }}/versions?per_page=5")
+          TAG=$(echo "$DATA" | jq -r '.[0].name')
+          DIGEST=$(echo "$DATA" | jq -r '.[0].metadata.container.digest // empty')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Latest tag: $TAG, Digest: $DIGEST"
+
+      - name: Check if already synced
+        id: check
+        run: |
+          # 检查目标仓库是否已有该 digest（通过拉取最新标签比对）
+          if skopeo inspect docker://docker.io/${{ env.DST_REPO }}:latest | jq -e ".Digest == \"${{ steps.ghcr.outputs.digest }}\"" > /dev/null; then
+            echo "synced=true" >> "$GITHUB_OUTPUT"
+            echo "Already synced, skip push."
+          else
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Copy to Docker Hub (Multi-arch)
+        if: steps.check.outputs.synced == 'false'
+        run: |
+          SRC=ghcr.io/${{ env.SRC_ORG }}/${{ env.SRC_PKG }}
+          TAG=${{ steps.ghcr.outputs.tag }}
+          DIGEST=${{ steps.ghcr.outputs.digest }}
+
+          # 同步原标签
+          if [ -n "$DIGEST" ]; then
+            skopeo copy docker://$SRC@$DIGEST docker://docker.io/${{ env.DST_REPO }}:$TAG
+          else
+            skopeo copy docker://$SRC:$TAG docker://docker.io/${{ env.DST_REPO }}:$TAG
+          fi
+
+          # 同步到 latest
+          skopeo copy docker://$SRC:$TAG docker://docker.io/${{ env.DST_REPO }}:latest
