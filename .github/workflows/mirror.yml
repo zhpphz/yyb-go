@@ -2,75 +2,47 @@ name: Mirror GHCR -> Docker Hub (yyb-go)
 
 on:
   schedule:
-    - cron: '*/30 * * * *' # 每30分钟检测
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  SRC_ORG: 525815266
-  SRC_PKG: yyb-go-enhanced
-  DST_REPO: zhpphz/yyb-go
+  SRC: ghcr.io/525815266/yyb-go-enhanced
+  DST: zhpphz/yyb-go
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
     steps:
-      - name: Install skopeo & jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y skopeo jq
-
       - name: Login Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Get latest GHCR version & digest (Robust)
-        id: ghcr
+      - name: Probe available tags (debug)
         run: |
-          # 增加 Accept Header，确保返回标准结构；先用 jq 判断是否为数组，安全提取第一条
-          DATA=$(curl -s -H "Accept: application/vnd.github+json" "https://api.github.com/users/${{ env.SRC_ORG }}/packages/container/${{ env.SRC_PKG }}/versions?per_page=5")
-          
-          # 安全提取：如果是数组取[0]，否则取自身；提取 name 和 digest
-          TAG=$(echo "$DATA" | jq -r 'if type=="array" then .[0].name else .name end')
-          DIGEST=$(echo "$DATA" | jq -r 'if type=="array" then .[0].metadata.container.digest // empty else .metadata.container.digest // empty end')
-          
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "Latest tag: $TAG"
-          echo "Latest digest: $DIGEST"
+          # 列出源仓库真实存在的 tag，避免用错的 digest
+          curl -s "https://api.github.com/users/525815266/packages/container/yyb-go-enhanced/versions?per_page=20" \
+            | jq -r 'if type=="array" then .[]?.name else .name end' || true
+        continue-on-error: true
 
-      - name: Check if already synced (Skip if no change)
-        id: check
+      - name: Pull from GHCR
+        run: |
+          # 直接拉取 :latest，绕开不稳定的 digest 字段
+          docker pull ${{ env.SRC }}:latest
+
+      - name: Tag & Push to Docker Hub
+        run: |
+          docker tag ${{ env.SRC }}:latest ${{ env.DST }}:latest
+          docker push ${{ env.DST }}:latest
+
+      - name: Also push version tag (optional)
         continue-on-error: true
         run: |
-          # 若目标 latest 不存在或 digest 不同，则继续；否则跳过
-          REMOTE_DIGEST=$(skopeo inspect docker://docker.io/${{ env.DST_REPO }}:latest 2>/dev/null | jq -r '.Digest // empty')
-          if [ "$REMOTE_DIGEST" = "${{ steps.ghcr.outputs.digest }}" ] && [ -n "$REMOTE_DIGEST" ]; then
-            echo "synced=true" >> "$GITHUB_OUTPUT"
-            echo "Digest unchanged, skip."
-          else
-            echo "synced=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Copy to Docker Hub (Multi-arch)
-        if: steps.check.outputs.synced != 'true'
-        run: |
-          SRC=ghcr.io/${{ env.SRC_ORG }}/${{ env.SRC_PKG }}
-          TAG=${{ steps.ghcr.outputs.tag }}
-          DIGEST=${{ steps.ghcr.outputs.digest }}
-
-          echo "Syncing $SRC ..."
-
-          # 同步原标签 (优先用 digest 保证多架构精准)
-          if [ -n "$DIGEST" ]; then
-            skopeo copy docker://$SRC@$DIGEST docker://docker.io/${{ env.DST_REPO }}:$TAG
-          else
-            skopeo copy docker://$SRC:$TAG docker://docker.io/${{ env.DST_REPO }}:$TAG
-          fi
-
-          # 同步到 latest
-          skopeo copy docker://$SRC:$TAG docker://docker.io/${{ env.DST_REPO }}:latest
+          # 如果 :latest 拉取成功，再尝试打一个带日期的版本号，便于回滚
+          TAG=$(date +'%Y%m%d-%H%M')
+          docker tag ${{ env.SRC }}:latest ${{ env.DST }}:$TAG
+          docker push ${{ env.DST }}:$TAG
