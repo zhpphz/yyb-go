@@ -2,8 +2,8 @@ name: Mirror GHCR -> Docker Hub (yyb-go)
 
 on:
   schedule:
-    - cron: '*/30 * * * *' # 每30分钟检测一次
-  workflow_dispatch: # 允许手动触发
+    - cron: '*/30 * * * *' # 每30分钟检测
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,7 +11,7 @@ permissions:
 env:
   SRC_ORG: 525815266
   SRC_PKG: yyb-go-enhanced
-  DST_REPO: zhpphz/yyb-go # 你的目标镜像名
+  DST_REPO: zhpphz/yyb-go
 
 jobs:
   mirror:
@@ -28,35 +28,44 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Get latest GHCR version & digest
+      - name: Get latest GHCR version & digest (Robust)
         id: ghcr
         run: |
-          DATA=$(curl -s "https://api.github.com/users/${{ env.SRC_ORG }}/packages/container/${{ env.SRC_PKG }}/versions?per_page=5")
-          TAG=$(echo "$DATA" | jq -r '.[0].name')
-          DIGEST=$(echo "$DATA" | jq -r '.[0].metadata.container.digest // empty')
+          # 增加 Accept Header，确保返回标准结构；先用 jq 判断是否为数组，安全提取第一条
+          DATA=$(curl -s -H "Accept: application/vnd.github+json" "https://api.github.com/users/${{ env.SRC_ORG }}/packages/container/${{ env.SRC_PKG }}/versions?per_page=5")
+          
+          # 安全提取：如果是数组取[0]，否则取自身；提取 name 和 digest
+          TAG=$(echo "$DATA" | jq -r 'if type=="array" then .[0].name else .name end')
+          DIGEST=$(echo "$DATA" | jq -r 'if type=="array" then .[0].metadata.container.digest // empty else .metadata.container.digest // empty end')
+          
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "Latest tag: $TAG, Digest: $DIGEST"
+          echo "Latest tag: $TAG"
+          echo "Latest digest: $DIGEST"
 
-      - name: Check if already synced
+      - name: Check if already synced (Skip if no change)
         id: check
+        continue-on-error: true
         run: |
-          # 检查目标仓库是否已有该 digest（通过拉取最新标签比对）
-          if skopeo inspect docker://docker.io/${{ env.DST_REPO }}:latest | jq -e ".Digest == \"${{ steps.ghcr.outputs.digest }}\"" > /dev/null; then
+          # 若目标 latest 不存在或 digest 不同，则继续；否则跳过
+          REMOTE_DIGEST=$(skopeo inspect docker://docker.io/${{ env.DST_REPO }}:latest 2>/dev/null | jq -r '.Digest // empty')
+          if [ "$REMOTE_DIGEST" = "${{ steps.ghcr.outputs.digest }}" ] && [ -n "$REMOTE_DIGEST" ]; then
             echo "synced=true" >> "$GITHUB_OUTPUT"
-            echo "Already synced, skip push."
+            echo "Digest unchanged, skip."
           else
             echo "synced=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Copy to Docker Hub (Multi-arch)
-        if: steps.check.outputs.synced == 'false'
+        if: steps.check.outputs.synced != 'true'
         run: |
           SRC=ghcr.io/${{ env.SRC_ORG }}/${{ env.SRC_PKG }}
           TAG=${{ steps.ghcr.outputs.tag }}
           DIGEST=${{ steps.ghcr.outputs.digest }}
 
-          # 同步原标签
+          echo "Syncing $SRC ..."
+
+          # 同步原标签 (优先用 digest 保证多架构精准)
           if [ -n "$DIGEST" ]; then
             skopeo copy docker://$SRC@$DIGEST docker://docker.io/${{ env.DST_REPO }}:$TAG
           else
